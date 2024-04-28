@@ -57,6 +57,34 @@ from .configuration_bart import BartConfig
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    # if this is fine, then att2 is good
+
+def initialize_attention(is_cross_attention, past_key_value,
+        key_value_states, bsz, key_states, hidden_states):
+    if (
+        is_cross_attention
+        and past_key_value is not None
+        and past_key_value[0].shape[2] == key_value_states.shape[1]
+    ):
+        # reuse k,v, cross_attentions
+        key_states = past_key_value[0].transpose(1, 2)
+        value_states = past_key_value[1].transpose(1, 2)
+    elif is_cross_attention:
+        # cross_attentions
+        key_states = obj._reshape(obj.k_proj(key_value_states), -1, bsz)
+        value_states = obj._reshape(obj.v_proj(key_value_states), -1, bsz)
+    elif past_key_value is not None:
+        # reuse k, v, self_attention
+        key_states = obj._reshape(obj.k_proj(hidden_states), -1, bsz)
+        value_states = obj._reshape(obj.v_proj(hidden_states), -1, bsz)
+        key_states = torch.cat([past_key_value[0].transpose(1, 2), key_states], dim=1)
+        value_states = torch.cat([past_key_value[1].transpose(1, 2), value_states], dim=1)
+    else:
+        # self_attention
+        key_states = self._reshape(self.k_proj(hidden_states), -1, bsz)
+        value_states = self._reshape(self.v_proj(hidden_states), -1, bsz)
+    return key_states, value_states
+
 
 
 logger = logging.get_logger(__name__)
@@ -269,31 +297,6 @@ class BartAttention(nn.Module):
 
         return attn_output, attn_weights_reshaped, past_key_value
 
-def initialize_attention(is_cross_attention, past_key_value,
-        key_value_states, bsz, key_states, hidden_states):
-    if (
-        is_cross_attention
-        and past_key_value is not None
-        and past_key_value[0].shape[2] == key_value_states.shape[1]
-    ):
-        # reuse k,v, cross_attentions
-        key_states = past_key_value[0].transpose(1, 2)
-        value_states = past_key_value[1].transpose(1, 2)
-    elif is_cross_attention:
-        # cross_attentions
-        key_states = obj._reshape(obj.k_proj(key_value_states), -1, bsz)
-        value_states = obj._reshape(obj.v_proj(key_value_states), -1, bsz)
-    elif past_key_value is not None:
-        # reuse k, v, self_attention
-        key_states = obj._reshape(obj.k_proj(hidden_states), -1, bsz)
-        value_states = obj._reshape(obj.v_proj(hidden_states), -1, bsz)
-        key_states = torch.cat([past_key_value[0].transpose(1, 2), key_states], dim=1)
-        value_states = torch.cat([past_key_value[1].transpose(1, 2), value_states], dim=1)
-    else:
-        # self_attention
-        key_states = self._reshape(self.k_proj(hidden_states), -1, bsz)
-        value_states = self._reshape(self.v_proj(hidden_states), -1, bsz)
-    return key_states, value_states
 
 class BartFlashAttention2(BartAttention):
     """
@@ -532,28 +535,8 @@ class BartSdpaAttention(BartAttention):
         # `past_key_value[0].shape[2] == key_value_states.shape[1]`
         # is checking that the `sequence_length` of the `past_key_value` is the same as
         # the provided `key_value_states` to support prefix tuning
-        if (
-            is_cross_attention
-            and past_key_value is not None
-            and past_key_value[0].shape[2] == key_value_states.shape[1]
-        ):
-            # reuse k,v, cross_attentions
-            key_states = past_key_value[0]
-            value_states = past_key_value[1]
-        elif is_cross_attention:
-            # cross_attentions
-            key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
-            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
-        elif past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        else:
-            # self_attention
-            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+        key_states, value_states = initialize_attention(is_cross_attention, past_key_value,
+            key_value_states, bsz, key_states, hidden_states)
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
